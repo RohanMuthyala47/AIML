@@ -1,0 +1,277 @@
+import cv2
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+import mediapipe as mp
+import os
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+
+# MediaPipe setup for hand detection
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+class SignLanguageDetector:
+    def __init__(self, model_path=None):
+        self.cap = None
+        self.model = self.build_model() if model_path is None else tf.keras.models.load_model(model_path)
+        self.hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        
+    def build_model(self):
+        """Create a CNN model for sign language digit detection"""
+        model = Sequential([
+            # First convolutional layer
+            Conv2D(32, (3, 3), activation='relu', padding='same', input_shape=(64, 64, 1)),
+            MaxPooling2D((2, 2)),
+            
+            # Second convolutional layer
+            Conv2D(64, (3, 3), activation='relu', padding='same'),
+            MaxPooling2D((2, 2)),
+            
+            # Third convolutional layer
+            Conv2D(128, (3, 3), activation='relu', padding='same'),
+            MaxPooling2D((2, 2)),
+            
+            # Flatten and dense layers
+            Flatten(),
+            Dense(128, activation='relu'),
+            Dropout(0.5),
+            Dense(4, activation='softmax')  # 4 classes: 0, 1, 2, 3
+        ])
+        
+        model.compile(
+            optimizer='adam',
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        return model
+    
+    def preprocess_hand_region(self, frame):
+        """Detect hand, extract ROI, and preprocess for the model"""
+        # Convert to RGB for MediaPipe
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.hands.process(frame_rgb)
+        
+        # If no hand is detected, return None
+        if not results.multi_hand_landmarks:
+            return None, None
+        
+        # Extract the hand region
+        h, w, _ = frame.shape
+        hand_landmarks = results.multi_hand_landmarks[0]
+        
+        # Calculate bounding box around hand
+        x_min, x_max, y_min, y_max = w, 0, h, 0
+        for landmark in hand_landmarks.landmark:
+            x, y = int(landmark.x * w), int(landmark.y * h)
+            x_min = min(x_min, x)
+            x_max = max(x_max, x)
+            y_min = min(y_min, y)
+            y_max = max(y_max, y)
+        
+        # Add padding around hand
+        padding = 20
+        x_min = max(0, x_min - padding)
+        y_min = max(0, y_min - padding)
+        x_max = min(w, x_max + padding)
+        y_max = min(h, y_max + padding)
+        
+        # Extract ROI
+        hand_roi = frame[y_min:y_max, x_min:x_max]
+        
+        # Check if ROI is valid
+        if hand_roi.size == 0:
+            return None, None
+        
+        # Convert to grayscale
+        hand_roi_gray = cv2.cvtColor(hand_roi, cv2.COLOR_BGR2GRAY)
+        
+        # Resize to 64x64
+        hand_roi_resized = cv2.resize(hand_roi_gray, (64, 64))
+        
+        # Normalize pixel values
+        hand_roi_normalized = hand_roi_resized / 255.0
+        
+        # Reshape for model input
+        processed = hand_roi_normalized.reshape(1, 64, 64, 1)
+        
+        # For visualization
+        bbox = (x_min, y_min, x_max, y_max)
+        
+        return processed, bbox
+    
+    def create_no_hand_dataset(self, num_samples=100, output_dir='no_hand_samples'):
+        """Create a dataset of frames with no hands for reference"""
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        self.cap = cv2.VideoCapture(0)
+        count = 0
+        
+        print("Capturing 'no hand' samples. Please ensure NO hands are visible in the frame.")
+        print("Press 'q' to stop early.")
+        
+        while count < num_samples:
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+                
+            # Display the frame
+            cv2.putText(frame, f"Capturing: {count+1}/{num_samples}", (50, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            cv2.imshow('Capturing No Hand Samples', frame)
+            
+            # Save the frame
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame_resized = cv2.resize(frame_gray, (64, 64))
+            cv2.imwrite(os.path.join(output_dir, f"no_hand_{count}.jpg"), frame_resized)
+            
+            count += 1
+            
+            # Break the loop with 'q'
+            if cv2.waitKey(100) & 0xFF == ord('q'):
+                break
+                
+        self.cap.release()
+        cv2.destroyAllWindows()
+        print(f"Captured {count} 'no hand' samples.")
+    
+    def train_with_dataset(self, dataset_path, no_hand_path=None, epochs=15, batch_size=32):
+        """Train the model with the dataset and optional 'no hand' samples"""
+        # Load digit data (0-3)
+        X_train = []
+        y_train = []
+        
+        for digit in range(4):  # 0, 1, 2, 3
+            digit_dir = os.path.join(dataset_path, str(digit))
+            
+            if not os.path.exists(digit_dir):
+                print(f"Warning: Directory for digit {digit} not found at {digit_dir}")
+                continue
+                
+            files = [f for f in os.listdir(digit_dir) if f.endswith('.jpg') or f.endswith('.png')]
+            print(f"Found {len(files)} images for digit {digit}")
+            
+            for img_file in files:
+                img_path = os.path.join(digit_dir, img_file)
+                img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+                img = cv2.resize(img, (64, 64))
+                
+                X_train.append(img)
+                y_train.append(digit)
+        
+        # Split data into training and validation sets
+        X_train = np.array(X_train).reshape(-1, 64, 64, 1) / 255.0
+        y_train = np.array(y_train)
+        
+        X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.2, random_state=42)
+        
+        # Train the model
+        history = self.model.fit(
+            X_train, y_train,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_data=(X_val, y_val),
+            callbacks=[
+                tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
+                tf.keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=3)
+            ]
+        )
+        
+        # Plot training history
+        plt.figure(figsize=(12, 4))
+        plt.subplot(1, 2, 1)
+        plt.plot(history.history['accuracy'])
+        plt.plot(history.history['val_accuracy'])
+        plt.title('Model accuracy')
+        plt.ylabel('Accuracy')
+        plt.xlabel('Epoch')
+        plt.legend(['Train', 'Validation'], loc='upper left')
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(history.history['loss'])
+        plt.plot(history.history['val_loss'])
+        plt.title('Model loss')
+        plt.ylabel('Loss')
+        plt.xlabel('Epoch')
+        plt.legend(['Train', 'Validation'], loc='upper left')
+        plt.tight_layout()
+        plt.savefig('training_history.png')
+        
+        # Save the model
+        self.model.save('sign_language_model.h5')
+        print("Model saved as 'sign_language_model.h5'")
+    
+    def start_webcam_detection(self):
+        """Start the webcam and detect signs in real-time"""
+        self.cap = cv2.VideoCapture(0)
+        
+        while True:
+            # Capture frame-by-frame
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            
+            # Process frame
+            processed_hand, bbox = self.preprocess_hand_region(frame)
+            
+            # If hand is detected
+            if processed_hand is not None:
+                # Get prediction
+                prediction = self.model.predict(processed_hand, verbose=0)
+                digit = np.argmax(prediction[0])
+                confidence = prediction[0][digit]
+                
+                # Display prediction
+                label = f"Digit: {digit} ({confidence:.2f})"
+                cv2.putText(frame, label, (50, 50), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                
+                # Draw bounding box
+                x_min, y_min, x_max, y_max = bbox
+                cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+            else:
+                # No hand detected
+                cv2.putText(frame, "No hand detected", (50, 50), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            
+            # Display the frame
+            cv2.imshow('Sign Language Detector', frame)
+            
+            # Break the loop with 'q'
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        
+        # Release the capture when done
+        self.cap.release()
+        cv2.destroyAllWindows()
+    
+    def stop_webcam(self):
+        """Stop the webcam if it's running"""
+        if self.cap is not None and self.cap.isOpened():
+            self.cap.release()
+            cv2.destroyAllWindows()
+
+# Example usage
+if __name__ == "__main__":
+    # Create detector
+    detector = SignLanguageDetector()
+    
+    # Uncomment to create a 'no hand' dataset
+    # detector.create_no_hand_dataset(num_samples=100)
+    
+    # Uncomment to train the model
+    # detector.train_with_dataset('path/to/sign_language_dataset')
+    
+    # Or load a pre-trained model
+    # detector = SignLanguageDetector('sign_language_model.h5')
+    
+    # Start webcam detection
+    detector.start_webcam_detection()
